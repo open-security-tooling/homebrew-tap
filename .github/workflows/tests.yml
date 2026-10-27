@@ -1,0 +1,92 @@
+# Test formulae on every PR.
+#
+# Doesn't use Homebrew/actions (setup-homebrew, test-bot): they aren't on the
+# Marketplace, so the org's allowed-actions policy blocks them. GitHub's macOS and
+# Ubuntu images already include Homebrew, so we link this checkout in as the tap.
+#
+# Before a PR can merge, this checks that every binary the formula downloads has
+# build provenance from an open-security-tooling release workflow. The formula's
+# sha256 alone only proves "the same bytes as when the PR was opened".
+
+name: Test formulae
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  provenance:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check every download's provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          pattern='https://github\.com/open-security-tooling/([A-Za-z0-9._-]+)/releases/download/(v[0-9A-Za-z.+-]+)/[A-Za-z0-9._-]+'
+          shopt -s nullglob
+          files=(Formula/*.rb)
+          urls=$( ((${#files[@]})) && grep -ohE "$pattern" "${files[@]}" | sort -u || true)
+          if [ -z "$urls" ]; then
+            echo "No formulae yet; nothing to check."
+            exit 0
+          fi
+          for url in $urls; do
+            [[ "$url" =~ $pattern ]]
+            repo="open-security-tooling/${BASH_REMATCH[1]}" tag="${BASH_REMATCH[2]}"
+            f="$RUNNER_TEMP/$(basename "$url")"
+            curl -fsSL --proto '=https' -o "$f" "$url"
+            # Signer must be a workflow in our org (stage 1: the tool's release.yml;
+            # stage 2: release-workflows/go-cli.yml; tighten to --signer-workflow then).
+            gh attestation verify "$f" --repo "$repo" --source-ref "refs/tags/$tag" \
+              --cert-identity-regex '^https://github\.com/open-security-tooling/' --deny-self-hosted-runners
+            want=$(grep -A1 -F "$url" Formula/*.rb | grep -oE '[0-9a-f]{64}' | head -1)
+            got=$(sha256sum "$f" | cut -d' ' -f1)
+            [ "$want" = "$got" ] || { echo "::error::sha256 in the formula doesn't match $url"; exit 1; }
+          done
+
+  install:
+    needs: provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Use this checkout as the tap
+        run: |
+          set -euo pipefail
+          for b in /opt/homebrew/bin/brew /usr/local/bin/brew /home/linuxbrew/.linuxbrew/bin/brew; do
+            [ -x "$b" ] && { eval "$("$b" shellenv)"; break; }
+          done
+          dirname "$(command -v brew)" >> "$GITHUB_PATH"
+          taps="$(brew --repository)/Library/Taps/open-security-tooling"
+          mkdir -p "$taps"
+          ln -sfn "$GITHUB_WORKSPACE" "$taps/homebrew-tap"
+      - name: Audit, install and test
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in Formula/*.rb; do
+            name="open-security-tooling/tap/$(basename "$f" .rb)"
+            # Installing by full name trusts just this formula (Homebrew 7 tap trust).
+            brew install "$name"
+            brew test "$name"
+            brew audit --strict --online "$name"
+          done

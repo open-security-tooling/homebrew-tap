@@ -1,0 +1,120 @@
+# Update formulae for new releases. Pull, don't push: this tap reads each
+# tool's public release, verifies every binary's build provenance, and only
+# then commits the new formula to main. No other repo holds a credential for
+# this one, and the only token is this repo's own GITHUB_TOKEN.
+#
+# The formula is generated entirely from verified release files, so there's
+# nothing for a person to review; the provenance check is the gate. Files are
+# written through the GitHub API, so GitHub signs the commits. The main-branch
+# ruleset lets GitHub Actions (and only it) commit without a pull request.
+
+name: Update formulae
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: threat-model release tag (default the latest release)
+        required: false
+  schedule:
+    - cron: "17 * * * *" # hourly, so new releases show up in brew within the hour
+
+permissions: {}
+
+concurrency:
+  group: update-formulae
+  cancel-in-progress: false
+
+jobs:
+  threat:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit the verified formula
+    steps:
+      - name: Verify the release and propose the formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_INPUT: ${{ inputs.tag }}
+          TAP: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          src=open-security-tooling/threat-model
+          tag=${TAG_INPUT:-$(gh release view --repo "$src" --json tagName --jq .tagName 2>/dev/null || true)}
+          if [ -z "$tag" ]; then
+            echo "No release of $src yet."
+            exit 0
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::'$tag' isn't a stable release tag (vMAJOR.MINOR.PATCH)."
+            exit 1
+          fi
+          version=${tag#v}
+
+          if gh api "repos/$TAP/contents/Formula/threat.rb" --jq .content 2>/dev/null | base64 -d | grep -qxF "  version \"$version\""; then
+            echo "Formula is already at $version."
+            exit 0
+          fi
+          dir=$(mktemp -d)
+          declare -A sums
+          for target in darwin_arm64 darwin_amd64 linux_arm64 linux_amd64; do
+            file="threat_$target"
+            gh release download "$tag" --repo "$src" --pattern "$file" --dir "$dir"
+            # Built by threat-model's release workflow, from this tag, on GitHub's runners.
+            gh attestation verify "$dir/$file" --repo "$src" \
+              --signer-workflow "$src/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$tag" --deny-self-hosted-runners
+            sums[$target]=$(sha256sum "$dir/$file" | cut -d' ' -f1)
+          done
+
+          base="https://github.com/$src/releases/download/$tag"
+          cat > "$dir/threat.rb" <<RUBY
+          # Proposed by .github/workflows/update.yml after verifying build provenance.
+          class Threat < Formula
+            desc "Threat modeling for developers: plain-file models, explained risk, CI checks"
+            homepage "https://github.com/$src"
+            version "$version"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "$base/threat_darwin_arm64"
+                sha256 "${sums[darwin_arm64]}"
+              end
+              on_intel do
+                url "$base/threat_darwin_amd64"
+                sha256 "${sums[darwin_amd64]}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/threat_linux_arm64"
+                sha256 "${sums[linux_arm64]}"
+              end
+              on_intel do
+                url "$base/threat_linux_amd64"
+                sha256 "${sums[linux_amd64]}"
+              end
+            end
+
+            def install
+              binary = Dir["threat_*"].fetch(0)
+              chmod 0755, binary
+              bin.install binary => "threat"
+            end
+
+            test do
+              assert_equal "threat #{version}", shell_output("#{bin}/threat version").strip
+            end
+          end
+          RUBY
+          sed -i 's/^          //' "$dir/threat.rb"
+
+          args=(-X PUT "repos/$TAP/contents/Formula/threat.rb" -f message="threat $version" -f branch=main
+                -f content="$(base64 -w0 "$dir/threat.rb")")
+          if sha=$(gh api "repos/$TAP/contents/Formula/threat.rb?ref=main" --jq .sha 2>/dev/null); then
+            args+=(-f sha="$sha")
+          fi
+          gh api "${args[@]}" > /dev/null
+          echo "::notice::Formula updated to threat $version after verifying its build provenance."
+          echo "Formula updated to threat $version after verifying its build provenance." >> "$GITHUB_STEP_SUMMARY"
