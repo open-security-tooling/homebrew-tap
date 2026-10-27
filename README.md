@@ -15,11 +15,10 @@ brew trust --formula open-security-tooling/tap/threat
 ## How formulae get here
 
 1. A tool's release workflow publishes an immutable GitHub release with signed build provenance.
-2. This tap's [update workflow](.github/workflows/update.yml) pulls the release, verifies every binary's provenance with `gh attestation verify`, and pushes a branch with the new formula. GitHub signs the commit. Nothing outside this repo can write to it.
+2. Within the hour, this tap's [update workflow](.github/workflows/update.yml) pulls the release, verifies every binary with `gh attestation verify` (built by the tool's release workflow, from the release tag, on GitHub's runners), and commits the new formula. GitHub signs the commit. Nothing outside this repo can write to it.
 3. [CI](.github/workflows/tests.yml) checks the provenance and SHA-256 values again, then installs and tests the formula on macOS and Linux.
-4. A maintainer opens the pull request, reviews it and merges it.
 
-Nothing is pushed to `main` directly: the repo has the org's default-branch ruleset (signed commits, pull requests only, no force-push).
+Only the update workflow commits to `main` directly; every other change needs a signed commit and a pull request.
 
 ## Verify what you installed
 
